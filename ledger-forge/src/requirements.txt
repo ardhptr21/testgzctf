@@ -1,0 +1,6 @@
+# Hand-rolled JWT verify/sign uses `cryptography` directly (RSA keygen, RS256
+# sign/verify). We deliberately do NOT use PyJWT: it guards against using an
+# RSA key as an HMAC secret — which is exactly the alg-confusion bug we plant.
+Flask==3.0.3
+Werkzeug==3.0.3
+cryptography==42.0.8

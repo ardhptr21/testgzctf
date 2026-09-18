@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""
+Persistent A&D checker worker. You normally DON'T edit this file — add your
+test cases in checks.py (just write a function and decorate it with @check).
+
+The worker listens on port 8081. The platform sends one JSON POST per check:
+  {"targetIp": "...", "targetPort": 8080, "flag": "...",
+   "round": 1, "teamId": "12"}
+Every request creates a fresh Target and runs all checks in isolation.
+
+Every @check function in checks.py runs in order. To report a verdict,
+either return normally (the check passed) or raise:
+  Mumble(msg)   service reachable but wrong (bad flag, broken endpoint)
+  Offline(msg)  can't reach the service — Target.get/post raise this for you
+Anything else that bubbles out is treated as InternalError (your bug,
+not the team's; the platform doesn't penalize a team for a broken checker).
+
+The response contains the worst verdict across all checks:
+  {"status": "Ok|Mumble|Offline|InternalError", "code": 0|1|2|3}
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import traceback
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import requests
+
+# enochecker3 exit-code contract. Ordered by severity so max() aggregates
+# correctly: a single Offline beats any number of Oks, etc.
+OK, MUMBLE, OFFLINE, INTERNAL_ERROR = 0, 1, 2, 3
+_NAME = {OK: "Ok", MUMBLE: "Mumble", OFFLINE: "Offline", INTERNAL_ERROR: "InternalError"}
+
+
+class CheckError(Exception):
+    """Base for verdict-bearing exceptions. Bare raises = InternalError."""
+
+    status = INTERNAL_ERROR
+
+
+class Mumble(CheckError):
+    """Service is up but behaving wrong (bad flag, broken response)."""
+
+    status = MUMBLE
+
+
+class Offline(CheckError):
+    """Couldn't reach the service at all (refused / timeout / DNS)."""
+
+    status = OFFLINE
+
+
+_CHECKS: list = []
+
+
+def check(fn):
+    """Register a test case. The function receives a single Target arg."""
+    _CHECKS.append(fn)
+    return fn
+
+
+@dataclass
+class Target:
+    """The team's service + this tick's context, handed to every check."""
+
+    ip: str
+    port: int
+    flag: str
+    round: int
+    team_id: str
+
+    @property
+    def url(self) -> str:
+        return f"http://{self.ip}:{self.port}"
+
+    def get(self, path: str = "/", **kw) -> "requests.Response":
+        return self._request("GET", path, **kw)
+
+    def post(self, path: str = "/", **kw) -> "requests.Response":
+        return self._request("POST", path, **kw)
+
+    def request(self, method: str, path: str = "/", **kw) -> "requests.Response":
+        return self._request(method, path, **kw)
+
+    def _request(self, method: str, path: str, **kw) -> "requests.Response":
+        kw.setdefault("timeout", 5)
+        try:
+            return requests.request(method, self.url + path, **kw)
+        except requests.exceptions.RequestException as e:
+            # No response at all → the service is down for us. Checks that
+            # want to assert on content will simply never reach that code.
+            raise Offline(f"{method} {path}: {e}") from e
+
+
+def run_once(target: Target) -> int:
+    # Note: the @check functions are registered by importing checks.py,
+    # which run.py does before calling us. We deliberately don't `import
+    # checks` here — running this file directly as __main__ would create a
+    # second copy of this module under the name "checker", and the
+    # decorators in checks.py would register into THAT copy's list instead
+    # of this one. run.py sidesteps that by only ever importing by name.
+    if not _CHECKS:
+        print("no checks registered — run via run.py (python3 run.py), "
+              "and add @check functions in checks.py", file=sys.stderr)
+        return INTERNAL_ERROR
+
+    worst = OK
+    for fn in _CHECKS:
+        name = getattr(fn, "__name__", "check")
+        try:
+            fn(target)
+        except CheckError as e:
+            worst = max(worst, e.status)
+            print(f"[{name}] {_NAME[e.status]}: {e}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — any stray error is our bug
+            worst = max(worst, INTERNAL_ERROR)
+            print(f"[{name}] InternalError: {e}", file=sys.stderr)
+            traceback.print_exc()
+        else:
+            print(f"[{name}] Ok", file=sys.stderr)
+
+    print(f"verdict: {_NAME[worst]}", file=sys.stderr)
+    return worst
+
+
+def _worker_target(payload: dict) -> Target:
+    return Target(
+        ip=str(payload["targetIp"]),
+        port=int(payload.get("targetPort", 80)),
+        flag=str(payload.get("flag", "")),
+        round=int(payload.get("round", 0)),
+        team_id=str(payload.get("teamId", "")),
+    )
+
+
+class _WorkerHandler(BaseHTTPRequestHandler):
+    server_version = "GZCTF-Checker-Worker/1"
+
+    def _json(self, status: int, body: dict) -> None:
+        raw = json.dumps(body, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._json(200, {"status": "ready"}) if self.path == "/healthz" else self._json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/check":
+            self._json(404, {"error": "not found"})
+            return
+        expected = os.environ.get("GZCTF_CHECKER_TOKEN", "")
+        if expected and self.headers.get("X-GZCTF-Checker-Token", "") != expected:
+            self._json(401, {"status": "InternalError", "code": INTERNAL_ERROR, "error": "unauthorized"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length))
+            verdict = run_once(_worker_target(payload))
+            self._json(200, {"status": _NAME[verdict], "code": verdict})
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            self._json(400, {"status": "InternalError", "code": INTERNAL_ERROR, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 — one failed request must not kill the worker
+            traceback.print_exc()
+            self._json(200, {"status": "InternalError", "code": INTERNAL_ERROR, "error": str(exc)})
+
+    def log_message(self, fmt: str, *args) -> None:
+        print(f"checker-worker: {fmt % args}", file=sys.stderr)
+
+
+def worker() -> None:
+    host = os.environ.get("GZCTF_CHECKER_BIND", "0.0.0.0")
+    port = int(os.environ.get("GZCTF_CHECKER_PORT", "8081"))
+    server = ThreadingHTTPServer((host, port), _WorkerHandler)
+    print(f"checker worker listening on {host}:{port}", file=sys.stderr, flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    # This image is intentionally persistent-only. Always start it through
+    # run.py so checks.py is imported and registered before serving HTTP.
+    print("persistent worker: start with python3 run.py", file=sys.stderr)
+    sys.exit(INTERNAL_ERROR)
