@@ -251,15 +251,31 @@ class CheckerTests(unittest.TestCase):
         self.assertTrue(all(flag["retrievable"] for flag in result["flags"]))
         self.assertEqual(old_key, self.service.PUB_PEM)
 
-    def test_ambiguous_write_missing_flag_is_internal_error_never_repaired(self):
+    def test_offline_at_round_start_does_not_attempt_ambiguous_placement(self):
+        with patch.object(checker, "run_once", side_effect=checker.Offline("restarting")), \
+                patch.object(checks, "get_flag", side_effect=checker.Offline("restarting")), \
+                patch.object(checks, "put_flag", side_effect=AssertionError("must not place while offline")):
+            result = self.check(1, ticks_per_round=5)
+        self.assertEqual(result["status"], "Offline")
+        self.assertEqual(result["flags"], [{"id": 1, "retrievable": False, "placement": "failed"}])
+        self.assertEqual(self.check(2, ticks_per_round=5)["status"], "Ok")  # Platform derives Mumble.
+
+    def test_target_response_deadline_is_offline_not_internal_error(self):
+        target = checker._worker_target(self.payload(1))
+        target.deadline = 0
+        result = checker.run_check(target)
+        self.assertEqual(result["status"], "Offline")
+        self.assertEqual(result["flags"][0]["placement"], "failed")
+
+    def test_ambiguous_write_does_not_poison_health_or_repair_the_flag(self):
         with patch.object(checks, "put_flag", side_effect=checker.Offline("write response lost")):
             result = self.check(1, ticks_per_round=5)
-        self.assertEqual(result["status"], "InternalError")
+        self.assertEqual(result["status"], "Offline")
         self.assertEqual(result["flags"][0]["placement"], "unknown")
         self.restart_worker()
         with patch.object(checks, "put_flag", side_effect=AssertionError("must not repair")):
             retry = self.check(2, ticks_per_round=5)
-        self.assertEqual(retry["status"], "InternalError")
+        self.assertEqual(retry["status"], "Ok")  # Platform derives Mumble, not InternalError.
         self.assertFalse(retry["flags"][0]["retrievable"])
 
     def test_ambiguous_write_can_resolve_by_readback_after_worker_replacement(self):
@@ -272,7 +288,7 @@ class CheckerTests(unittest.TestCase):
         with patch.object(checks, "put_flag", side_effect=accepted_then_lost), \
                 patch.object(checks, "get_flag", side_effect=checker.Offline("target restarting")):
             result = self.check(1)
-        self.assertEqual(result["status"], "InternalError")
+        self.assertEqual(result["status"], "Offline")
         checker._NEW_CLAIMS.clear()
         with patch.object(checks, "put_flag", side_effect=AssertionError("must only read")):
             retry = self.check(1)
@@ -283,7 +299,7 @@ class CheckerTests(unittest.TestCase):
         with patch.object(checks, "put_flag", side_effect=checker.Offline("write response lost")):
             self.check(1)
         result = self.check(2)
-        self.assertEqual(result["status"], "InternalError")
+        self.assertEqual(result["status"], "Ok")  # Platform derives Recovering.
         self.assertEqual(result["flags"], [
             {"id": 1, "retrievable": False, "placement": "unknown"},
             {"id": 2, "retrievable": True, "placement": "confirmed"},
@@ -306,7 +322,7 @@ class CheckerTests(unittest.TestCase):
                 result = self.check(tick, retained=[tick])
                 self.assertEqual(result["flags"][0]["placement"], placement)
                 self.assertFalse(result["flags"][0]["retrievable"])
-                self.assertEqual(result["status"], "InternalError" if placement == "unknown" else "Ok")
+                self.assertEqual(result["status"], "Ok")  # Platform derives Mumble.
 
     def test_contract_is_authenticated_v2_only_and_rejects_malformed_input(self):
         readiness = requests.get(f"http://127.0.0.1:{self.worker.server_port}/healthz", timeout=3).json()

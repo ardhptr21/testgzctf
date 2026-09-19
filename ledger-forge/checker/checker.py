@@ -93,7 +93,7 @@ class Target:
     def request(self, method, path="/", **kwargs):
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise Infrastructure("checker execution budget exhausted")
+            raise Offline("target response deadline exceeded")
         kwargs.setdefault("timeout", min(3, remaining))
         kwargs["allow_redirects"] = False
         kwargs["stream"] = True
@@ -105,7 +105,7 @@ class Target:
             for chunk in response.iter_content(1):
                 if time.monotonic() >= self.deadline:
                     response.close()
-                    raise Infrastructure("checker execution budget exhausted")
+                    raise Offline("target response deadline exceeded")
                 size += len(chunk)
                 if size > MAX_BODY:
                     response.close()
@@ -202,7 +202,7 @@ def run_check(target):
     except Exception:
         status = INTERNAL_ERROR
 
-    can_place = status != INTERNAL_ERROR
+    can_place = status == OK
     try:
         for flag, result in zip(target.flags, results):
             if flag.placement == "new":
@@ -217,7 +217,10 @@ def run_check(target):
                         # placement; only actual readback proves retention.
                     except Mumble:
                         result["placement"] = "failed"
-                    except (Offline, Infrastructure):
+                    except Offline:
+                        status = max(status, OFFLINE)
+                        result["placement"] = "unknown"
+                    except Infrastructure:
                         result["placement"] = "unknown"
                 else:
                     flag = replace(flag, placement="unknown")
@@ -232,11 +235,15 @@ def run_check(target):
             result["retrievable"] = found
             if found:
                 result["placement"] = "confirmed"
-            elif result["placement"] == "unknown":
-                # A write may have succeeded before a lost response. No repair
-                # and no negative retention evidence can safely be asserted.
-                status = INTERNAL_ERROR
-        return {"status": _NAME[status], "code": status, "flags": results}
+            # Keep unresolved placement read-only, but report service health
+            # independently. The platform excludes unknown retention evidence
+            # and derives Mumble/Recovering from missing current/older flags.
+        response = {"status": _NAME[status], "code": status, "flags": results}
+        if status != OK:
+            response["message"] = {MUMBLE: "ordinary service functionality failed",
+                                   OFFLINE: "target service is unreachable",
+                                   INTERNAL_ERROR: "checker execution failed"}[status]
+        return response
     except Exception:
         # Unknown checker errors never become service failure evidence.
         return {"status": "InternalError", "code": INTERNAL_ERROR, "flags": results}

@@ -73,7 +73,9 @@ owns whether placement has been attempted. Every requested flag includes:
 Results include `id`, `retrievable`, and `placement` (`confirmed`, `failed`, or
 `unknown`) for every flag. The top-level status describes functionality; GZCTF
 derives `Recovering` when old flags are missing and `Mumble` when the newest
-flag is missing. An unresolved placement/worker error is `InternalError`.
+flag is missing. An unreachable target is `Offline`; only worker/contract failures
+are `InternalError`. Unresolved flag placement remains read-only and is excluded
+from retention-loss evidence, but does not poison later health checks.
 Unknown writes are never retried blindly or silently scored as a team failure.
 
 `GET /healthz` must advertise `protocolVersion: 2`,
