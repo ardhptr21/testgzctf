@@ -5,6 +5,7 @@ Challenge-specific hooks are in checks.py. The platform persists placement
 state BEFORE dispatching a new flag. No pod-local database, privileged flag
 reader, exploit, or repair of historical data is used. An ambiguous first
 write is an infrastructure error, never fabricated missing-flag evidence.
+Flags change only at round boundaries; intermediate ticks only validate them.
 """
 from __future__ import annotations
 
@@ -68,6 +69,7 @@ class Target:
     round: int
     tick: int
     tick_number: int
+    round_start_tick: int
     team_id: str
     challenge_id: int
     flags: tuple[RetainedFlag, ...]
@@ -139,6 +141,10 @@ def _worker_target(payload):
         raise ValueError("invalid targetIp")
     host = str(ipaddress.ip_address(host))
     tick_number = _integer(payload.get("tickNumber"), "tickNumber")
+    round_start_tick = _integer(payload.get("roundStartTick"), "roundStartTick", high=tick_number)
+    tick = _integer(payload.get("tick"), "tick")
+    if tick != tick_number - round_start_tick + 1:
+        raise ValueError("tick does not match its flag round")
     team_id = payload.get("teamId")
     if not isinstance(team_id, str) or not team_id.isascii() or not team_id.isdigit() or len(team_id) > 20 or int(team_id) < 1:
         raise ValueError("invalid teamId")
@@ -151,22 +157,24 @@ def _worker_target(payload):
             raise ValueError("invalid retained flag")
         flag_id = _integer(item.get("id"), "flag id")
         value = item.get("flag")
-        issued = _integer(item.get("plantedAtTick"), "plantedAtTick", high=tick_number)
+        issued = _integer(item.get("plantedAtTick"), "plantedAtTick", high=round_start_tick)
         placement = item.get("placement")
         if not isinstance(value, str) or not 1 <= len(value) <= 4096 or flag_id in seen_ids or value in seen_values:
             raise ValueError("invalid or duplicate retained flag")
         if placement not in ("new", "unknown", "confirmed", "failed"):
             raise ValueError("platform-v1 placement state required")
-        if placement == "new" and issued != tick_number:
-            raise ValueError("historical flags must never be initialized")
+        if placement == "new" and (issued != round_start_tick or tick_number != round_start_tick):
+            raise ValueError("new flags require the first tick of their round")
         flags.append(RetainedFlag(flag_id, value, issued, placement))
         seen_ids.add(flag_id)
         seen_values.add(value)
-    if not any(flag.planted_at_tick == tick_number for flag in flags):
-        raise ValueError("no current-tick flag provided")
-    return Target(host, _integer(payload.get("targetPort"), "targetPort", high=65535),
-                  _integer(payload.get("round"), "round"), _integer(payload.get("tick"), "tick"),
-                  tick_number, team_id, _integer(payload.get("challengeId"), "challengeId"), tuple(flags))
+    if not any(flag.planted_at_tick == round_start_tick for flag in flags):
+        raise ValueError("no current-round flag provided")
+    return Target(ip=host, port=_integer(payload.get("targetPort"), "targetPort", high=65535),
+                  round=_integer(payload.get("round"), "round"), tick=tick,
+                  tick_number=tick_number, round_start_tick=round_start_tick,
+                  team_id=team_id, challenge_id=_integer(payload.get("challengeId"), "challengeId"),
+                  flags=tuple(flags))
 
 
 def _claim_new_once(target, flag):
@@ -266,7 +274,8 @@ class _WorkerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path == "/healthz":
-            self._json(200, {"status": "ready", "protocolVersion": 2, "flagPlacement": "platform-v1"})
+            self._json(200, {"status": "ready", "protocolVersion": 2,
+                             "flagPlacement": "platform-v1", "groupedRounds": True})
         else:
             self._json(404, {"error": "not found"})
 
@@ -294,9 +303,12 @@ class _WorkerHandler(BaseHTTPRequestHandler):
             self._json(503, {"status": "InternalError", "code": INTERNAL_ERROR, "error": "worker is busy"})
             return
         try:
-            self._json(200, run_check(target))
+            result = run_check(target)
         finally:
             self.server.check_lock.release()
+        # Release before responding: a client may send its next tick as soon as
+        # it receives the response, and must not see a spurious busy verdict.
+        self._json(200, result)
 
     def log_message(self, *_args):
         pass  # Request bodies, flags, credentials and target replies are secret.

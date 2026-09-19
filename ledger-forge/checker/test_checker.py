@@ -87,11 +87,22 @@ class CheckerTests(unittest.TestCase):
         self.http.server_close()
         self.http_thread.join()
 
-    def payload(self, tick, retained=None):
-        retained = list(range(1, tick + 1)) if retained is None else retained
+    def restart_worker(self):
+        self.worker.shutdown()
+        self.worker.server_close()
+        self.worker_thread.join()
+        checker._NEW_CLAIMS.clear()
+        self.worker = checker.WorkerServer(("127.0.0.1", 0), "test-only-worker-token")
+        self.worker_thread = threading.Thread(target=self.worker.serve_forever, daemon=True)
+        self.worker_thread.start()
+
+    def payload(self, tick, retained=None, *, ticks_per_round=1):
+        start = (tick - 1) // ticks_per_round * ticks_per_round + 1
+        retained = list(range(1, start + 1, ticks_per_round)) if retained is None else retained
         return {
             "protocolVersion": 2, "targetIp": "127.0.0.1", "targetPort": self.http.server_port,
-            "round": tick, "tick": 1, "tickNumber": tick, "teamId": "12", "challengeId": 8,
+            "round": (tick - 1) // ticks_per_round + 1, "tick": tick - start + 1,
+            "tickNumber": tick, "roundStartTick": start, "teamId": "12", "challengeId": 8,
             "flags": [{"id": number, "flag": "flag{ledger-v2-secret-" + str(number) + "}",
                        "plantedAtTick": number, "placement": self.platform_state.get(number, "new")}
                       for number in retained],
@@ -102,8 +113,8 @@ class CheckerTests(unittest.TestCase):
                                  headers={"X-GZCTF-Checker-Token": token}, timeout=30)
         return response.status_code, response.json()
 
-    def check(self, tick, retained=None):
-        code, result = self.send(self.payload(tick, retained))
+    def check(self, tick, retained=None, *, ticks_per_round=1):
+        code, result = self.send(self.payload(tick, retained, ticks_per_round=ticks_per_round))
         self.assertEqual(code, 200)
         for flag in result.get("flags", []):
             self.platform_state[flag["id"]] = flag["placement"]
@@ -128,13 +139,72 @@ class CheckerTests(unittest.TestCase):
         self.assertNotIn("/flag", self.paths)
 
     def test_patching_jwt_and_ssti_keeps_functionality_and_all_flags_green(self):
-        self.assertEqual(self.check(1)["status"], "Ok")
+        self.assertEqual(self.check(1, ticks_per_round=5)["status"], "Ok")
         self.stop_service()
         self.start_service(patched=True)
-        result = self.check(2)
-        self.assertEqual(result["status"], "Ok")
-        self.assertTrue(all(flag["retrievable"] for flag in result["flags"]))
+        for tick in range(2, 8):
+            result = self.check(tick, ticks_per_round=5)
+            self.assertEqual(result["status"], "Ok")
+            self.assertTrue(all(flag["retrievable"] for flag in result["flags"]))
         self.assertNotIn("/admin/report", self.paths)
+        self.assertNotIn("/flag", self.paths)
+
+    def test_grouped_rounds_check_every_tick_and_place_only_at_round_boundaries(self):
+        with patch.object(checker, "run_once", wraps=checker.run_once) as health, \
+                patch.object(checks, "put_flag", wraps=checks.put_flag) as put, \
+                patch.object(checks, "get_flag", wraps=checks.get_flag) as get:
+            for tick in range(1, 27):
+                # The platform, not the worker, selects the still-valid flags.
+                # Five flag rounds of five ticks keep flag 1 through tick 25.
+                retained = [issued for issued in range(1, tick + 1, 5) if tick < issued + 25]
+                with self.subTest(tick=tick):
+                    result = self.check(tick, retained, ticks_per_round=5)
+                    self.assertEqual(result["status"], "Ok")
+                    self.assertEqual(result["flags"], [
+                        {"id": issued, "retrievable": True, "placement": "confirmed"} for issued in retained
+                    ])
+            self.assertEqual(health.call_count, 26)
+            self.assertEqual([call.args[1].id for call in put.call_args_list], [1, 6, 11, 16, 21, 26])
+            self.assertEqual(sum(call.args[1].id == 1 for call in get.call_args_list), 25)
+            self.assertEqual([
+                (call.args[0].round, call.args[0].tick, call.args[0].round_start_tick)
+                for call in health.call_args_list
+            ], [((tick - 1) // 5 + 1, (tick - 1) % 5 + 1, (tick - 1) // 5 * 5 + 1)
+                for tick in range(1, 27)])
+
+    def test_intermediate_ticks_and_worker_replacement_never_repair_missing_round_flag(self):
+        self.check(1, ticks_per_round=5)
+        self.sql("DELETE FROM entries WHERE username = ?", (self.flag_identity(1)["username"],))
+        self.restart_worker()
+        with patch.object(checks, "put_flag", wraps=checks.put_flag) as put:
+            for tick in range(2, 6):
+                result = self.check(tick, ticks_per_round=5)
+                self.assertEqual(result["status"], "Ok")  # Platform derives Mumble.
+                self.assertEqual(result["flags"], [{"id": 1, "retrievable": False, "placement": "confirmed"}])
+            put.assert_not_called()
+            for tick in (6, 7):
+                result = self.check(tick, ticks_per_round=5)
+                self.assertEqual(result["status"], "Ok")  # Platform derives Recovering.
+                self.assertEqual(result["flags"], [
+                    {"id": 1, "retrievable": False, "placement": "confirmed"},
+                    {"id": 6, "retrievable": True, "placement": "confirmed"},
+                ])
+            self.assertEqual([call.args[1].id for call in put.call_args_list], [6])
+        self.assertEqual(self.sql("SELECT memo FROM entries WHERE username = ?", (self.flag_identity(1)["username"],)), [])
+
+    def test_completed_check_unlocks_before_sending_response(self):
+        original_json = checker._WorkerHandler._json
+        locked_at_response = []
+
+        def observed(handler, status, body):
+            if handler.command == "POST" and status == 200:
+                locked_at_response.append(handler.server.check_lock.locked())
+            return original_json(handler, status, body)
+
+        with patch.object(checker._WorkerHandler, "_json", observed):
+            for tick in range(1, 8):
+                self.assertEqual(self.check(tick, ticks_per_round=5)["status"], "Ok")
+        self.assertEqual(locked_at_response, [False] * 7)
 
     def test_deleted_old_flag_is_false_without_repair_and_new_flag_survives(self):
         self.check(1)
@@ -183,12 +253,12 @@ class CheckerTests(unittest.TestCase):
 
     def test_ambiguous_write_missing_flag_is_internal_error_never_repaired(self):
         with patch.object(checks, "put_flag", side_effect=checker.Offline("write response lost")):
-            result = self.check(1)
+            result = self.check(1, ticks_per_round=5)
         self.assertEqual(result["status"], "InternalError")
         self.assertEqual(result["flags"][0]["placement"], "unknown")
-        checker._NEW_CLAIMS.clear()
+        self.restart_worker()
         with patch.object(checks, "put_flag", side_effect=AssertionError("must not repair")):
-            retry = self.check(1)
+            retry = self.check(2, ticks_per_round=5)
         self.assertEqual(retry["status"], "InternalError")
         self.assertFalse(retry["flags"][0]["retrievable"])
 
@@ -242,6 +312,7 @@ class CheckerTests(unittest.TestCase):
         readiness = requests.get(f"http://127.0.0.1:{self.worker.server_port}/healthz", timeout=3).json()
         self.assertEqual(readiness["protocolVersion"], 2)
         self.assertEqual(readiness["flagPlacement"], "platform-v1")
+        self.assertIs(readiness["groupedRounds"], True)
         self.assertEqual(self.send(self.payload(1), token="wrong")[0], 401)
         invalid = [
             {**self.payload(1), "protocolVersion": 1},
@@ -250,6 +321,18 @@ class CheckerTests(unittest.TestCase):
             {**self.payload(1), "targetPort": True},
             {**self.payload(1), "flags": self.payload(1)["flags"] * 2},
             {**self.payload(2), "flags": [{**self.payload(1)["flags"][0], "placement": "new"}, self.payload(2)["flags"][1]]},
+            {key: value for key, value in self.payload(1).items() if key != "roundStartTick"},
+            {**self.payload(1), "roundStartTick": True},
+            {**self.payload(1), "roundStartTick": 0},
+            {**self.payload(1), "roundStartTick": 2},
+            {**self.payload(1), "tick": 2},
+            self.payload(2, ticks_per_round=5),  # Cannot initialize flag 1 on validation tick 2.
+            {**self.payload(2, ticks_per_round=5), "flags": [
+                {"id": 2, "flag": "flag{invalid-mid-round}", "plantedAtTick": 2, "placement": "confirmed"}
+            ]},
+            {**self.payload(6, ticks_per_round=5), "flags": [
+                {**self.payload(1)["flags"][0], "placement": "confirmed"}
+            ]},  # The current round's flag cannot be omitted.
         ]
         for request in invalid:
             with self.subTest(request=request):

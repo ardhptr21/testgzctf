@@ -48,7 +48,9 @@ ad:
   # V2 persistent functionality + retained-data checker. The ./checker image is
   # built automatically from its Dockerfile on sync/import — do NOT set
   # checkerImage here; the tooling builds it and wires up the ref. The worker
-  # listens on port 8081 and accepts POST /check requests.
+  # listens on port 8081, advertises groupedRounds=true, and accepts POST /check
+  # with roundStartTick. New flags are stored only at round boundaries;
+  # intermediate ticks check functionality and retained data without rewriting it.
   # Public egress enabled.
   allowEgress: true
   allowSelfReset: true
