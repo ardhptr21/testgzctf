@@ -16,8 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py /app/app.py
 COPY supervisord.conf /etc/supervisord.conf
 
-# No baked flag: the platform supplies the live flag at $GZCTF_FLAG_FILE
-# (Docker: /flag bind-mount; K8s: /gzctf-flag/flag via the flag-pull sidecar).
-# app.py reads it fresh (only via the SSTI sink); a missing file = warmup.
+# V2 flags are private ledger records created through the ordinary service API.
+# Preserve this directory when replacing a container; process restarts retain it.
+ENV LEDGER_DATA_DIR=/app/data
+RUN mkdir -p /app/data
 EXPOSE 8080
 CMD ["supervisord", "-c", "/etc/supervisord.conf"]

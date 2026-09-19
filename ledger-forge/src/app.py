@@ -4,46 +4,35 @@
 #
 # A small JWT-authenticated EXPENSE LEDGER API: users register, log in, add
 # expense entries, list them, and (admins only) render a templated report.
-# Tokens are RS256-signed with an RSA keypair generated once at startup; the
+# Tokens are RS256-signed with a persisted RSA keypair; the
 # matching PUBLIC key is published at /pubkey (intended — attackers fetch it).
 #
-# Two deliberately planted, CHAINED bugs lead to the live flag:
+# The challenge retains its original JWT algorithm-confusion and template
+# rendering weaknesses. Neither weakness is exercised by the V2 checker.
 #
-#   BUG 1 — JWT ALGORITHM CONFUSION (verify_jwt below)
-#     The token verifier is HAND-ROLLED (so no library guard fights us). It
-#     trusts the `alg` field in the attacker-controlled header: RS256 is
-#     verified against the RSA public key, but HS256 is verified as
-#     HMAC-SHA256 keyed with the PUBLIC-KEY PEM BYTES. An attacker who GETs
-#     /pubkey therefore knows the HMAC secret and can forge ANY token —
-#     including {"user":"pwn","role":"admin"}.
-#
-#   BUG 2 — SERVER-SIDE TEMPLATE INJECTION (/admin/report)
-#     The admin-only report endpoint renders a USER-SUPPLIED template with
-#     Jinja2 render_template_string(...). Once you hold a forged admin token,
-#     that's RCE → read $GZCTF_FLAG_FILE.
-#
-#   THE CHAIN: GET /pubkey → forge an admin HS256 token (HMAC secret = the
-#   public-key PEM bytes) → POST /admin/report with an SSTI payload that
-#   reads the flag file.
-#
-# Flag plumbing (same contract as the other GZCTF A&D harness challenges):
-#   * The platform writes the live, per-tick flag to $GZCTF_FLAG_FILE
-#     (Docker: /flag bind-mount, K8s: /gzctf-flag/flag). We read it FRESH on
-#     demand — never baked into the image, and never referenced by normal
-#     code. The flag is ONLY reachable through the SSTI sink.
+# V2 flag storage: the checker logs in as an ordinary private account and
+# stores flags in ledger entries. It retrieves retained entries through the
+# same legitimate API, without exploiting either vulnerability. Accounts,
+# entries and signing keys live under LEDGER_DATA_DIR (default /app/data).
+# Preserve this data when patching/restarting the service.
 #
 # DEFENDER INTENT (don't ship a patch — keep it patchable): a defender fixes
 # this by (a) only accepting RS256 in verify_jwt AND (b) not rendering the
 # user template in /admin/report. The register / login / add-entry / list /
-# report SLA flow the checker drives must stay green either way.
+# normal-owner SLA flow the checker drives must stay green either way.
 # =============================================================================
 
 import base64
+import fcntl
 import hashlib
 import hmac
 import json
 import os
+import sqlite3
+import tempfile
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
@@ -53,11 +42,29 @@ from flask import Flask, jsonify, render_template_string, request
 app = Flask(__name__)
 
 # --------------------------------------------------------------------------- #
-# RSA keypair — generated ONCE at startup. Tokens are signed RS256 with the
+# RSA keypair — persisted across process restarts. Tokens are signed RS256 with the
 # private key; the public key PEM is published at /pubkey. The PEM BYTES are
 # also (the bug) accepted as an HS256 HMAC secret by the hand-rolled verifier.
 # --------------------------------------------------------------------------- #
-_PRIV_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+DATA_DIR = Path(os.environ.get("LEDGER_DATA_DIR", "/app/data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "ledger.sqlite3"
+
+# Preserve accounts, records and signing keys when defenders restart the app.
+# The data directory must also survive any deployment/container replacement.
+with (DATA_DIR / "key.lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    key_path = DATA_DIR / "private-key.pem"
+    if not key_path.exists():
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        with tempfile.NamedTemporaryFile(dir=DATA_DIR, prefix="private-key-", delete=False) as key_file:
+            key_file.write(private_key.private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption()))
+            key_file.flush()
+            os.fsync(key_file.fileno())
+        os.replace(key_file.name, key_path)
+    _PRIV_KEY = serialization.load_pem_private_key(key_path.read_bytes(), password=None)
 _PUB_KEY = _PRIV_KEY.public_key()
 # Serialize once and reuse the SAME bytes everywhere (served at /pubkey AND used
 # as the HS256 secret). Do NOT strip/normalize — byte identity is what makes the
@@ -67,10 +74,38 @@ PUB_PEM = _PUB_KEY.public_bytes(
     format=serialization.PublicFormat.SubjectPublicKeyInfo,
 )
 
-# In-memory stores (single Flask process). username -> {"password", "role"} and
-# username -> [entries]. Plain dicts are fine for an ephemeral A&D target.
-USERS: dict = {}
-ENTRIES: dict = {}
+@contextmanager
+def database():
+    db = sqlite3.connect(DB_PATH, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
+
+
+with database() as db:
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY, password TEXT NOT NULL, role TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
+            amount TEXT NOT NULL, memo TEXT NOT NULL, client_id TEXT);
+        CREATE INDEX IF NOT EXISTS entries_owner ON entries(username);
+        CREATE UNIQUE INDEX IF NOT EXISTS entries_client ON entries(username, client_id);
+        CREATE TABLE IF NOT EXISTS entry_requests (
+            username TEXT NOT NULL, client_id TEXT NOT NULL, entry_id INTEGER NOT NULL,
+            PRIMARY KEY (username, client_id));
+    """)
+
+
+def entries_for(user):
+    with database() as db:
+        rows = db.execute("SELECT * FROM entries WHERE username = ? ORDER BY id", (user,)).fetchall()
+    return [{"id": row["id"], "amount": json.loads(row["amount"]),
+             "memo": row["memo"], "clientId": row["client_id"]} for row in rows]
 
 
 # --------------------------------------------------------------------------- #
@@ -150,12 +185,13 @@ def register():
     data = request.get_json(silent=True) or {}
     user = data.get("username")
     pw = data.get("password")
-    if not user or not pw:
+    if not isinstance(user, str) or not user or not isinstance(pw, str) or not pw:
         return jsonify(ok=False, error="username and password required"), 400
-    if user in USERS:
+    try:
+        with database() as db:
+            db.execute("INSERT INTO users VALUES (?, ?, 'user')", (user, pw))
+    except sqlite3.IntegrityError:
         return jsonify(ok=False, error="user exists"), 409
-    USERS[user] = {"password": pw, "role": "user"}
-    ENTRIES.setdefault(user, [])
     return jsonify(ok=True)
 
 
@@ -164,7 +200,10 @@ def login():
     data = request.get_json(silent=True) or {}
     user = data.get("username")
     pw = data.get("password")
-    rec = USERS.get(user)
+    if not isinstance(user, str) or not isinstance(pw, str):
+        return jsonify(ok=False, error="invalid credentials"), 401
+    with database() as db:
+        rec = db.execute("SELECT * FROM users WHERE username = ?", (user,)).fetchone()
     if not rec or rec["password"] != pw:
         return jsonify(ok=False, error="invalid credentials"), 401
     return jsonify(ok=True, token=issue_jwt(user, rec["role"]))
@@ -185,14 +224,30 @@ def add_entry():
     data = request.get_json(silent=True) or {}
     amount = data.get("amount")
     memo = data.get("memo", "")
+    client_id = data.get("clientId")
     if amount is None:
         return jsonify(ok=False, error="amount required"), 400
+    if not isinstance(memo, str) or (client_id is not None and
+                                    (not isinstance(client_id, str) or not client_id or len(client_id) > 256)):
+        return jsonify(ok=False, error="invalid memo or clientId"), 400
     # Authorization is CLAIM-based: a forged user need not exist in USERS.
     user = claims.get("user", "")
-    bucket = ENTRIES.setdefault(user, [])
-    entry = {"id": len(bucket) + 1, "amount": amount, "memo": memo}
-    bucket.append(entry)
-    return jsonify(ok=True, id=entry["id"])
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        if client_id is not None:
+            previous = db.execute("SELECT entry_id FROM entry_requests WHERE username = ? AND client_id = ?",
+                                  (user, client_id)).fetchone()
+            if previous:
+                entry = db.execute("SELECT * FROM entries WHERE id = ?", (previous["entry_id"],)).fetchone()
+                if entry and json.loads(entry["amount"]) == amount and entry["memo"] == memo:
+                    return jsonify(ok=True, id=entry["id"])
+                # Retain a tombstone: a repeated write must never repair lost data.
+                return jsonify(ok=False, error="clientId already used"), 409
+        entry_id = db.execute("INSERT INTO entries(username, amount, memo, client_id) VALUES (?, ?, ?, ?)",
+                              (user, json.dumps(amount), memo, client_id)).lastrowid
+        if client_id is not None:
+            db.execute("INSERT INTO entry_requests VALUES (?, ?, ?)", (user, client_id, entry_id))
+    return jsonify(ok=True, id=entry_id)
 
 
 @app.get("/entries")
@@ -201,7 +256,7 @@ def list_entries():
     if not claims:
         return jsonify(ok=False, error="unauthorized"), 401
     user = claims.get("user", "")
-    return jsonify(ok=True, entries=ENTRIES.get(user, []))
+    return jsonify(ok=True, entries=entries_for(user))
 
 
 @app.get("/me")
@@ -225,7 +280,7 @@ def admin_report():
     title = data.get("title", "Expense Report")
     template = data.get("template", "")
     user = claims.get("user", "")
-    entries = ENTRIES.get(user, [])
+    entries = entries_for(user)
     # BUG: the user-supplied template is rendered server-side → SSTI → RCE.
     html = render_template_string(template, title=title, entries=entries)
     return jsonify(ok=True, html=html)

@@ -5,7 +5,7 @@ description: >
 
   add expense entries, list them, and (admins only) render a templated report.
 
-  Tokens are RS256-signed with an RSA keypair minted at startup; the matching
+  Tokens are RS256-signed with a persisted RSA keypair; the matching
 
   public key is published at `/pubkey`.
 
@@ -22,18 +22,18 @@ description: >
 
   `POST /admin/report` renders your supplied Jinja2 template server-side
 
-  (**SSTI → RCE**), which reads the live flag from `$GZCTF_FLAG_FILE`. The flag
+  (**SSTI → RCE**). V2 flags are stored as private ledger entries through the
 
-  is never referenced by normal code — only the SSTI sink can reach it.
+  normal account APIs, alongside other service data.
 
 
   Defenders: patch **both** bugs — accept only `RS256` in the verifier AND stop
 
   rendering the user template — without breaking the register / login /
 
-  add-entry / list / report SLA flow the checker drives. Attackers: chain
+  add-entry / list flow the checker drives. Preserve `/app/data` while patching
 
-  `/pubkey` → forged admin token → SSTI to steal other teams' flags.
+  and restarting: retained private records must remain available to their owners.
 type: AttackDefense
 category: Web
 # containerImage omitted on purpose -> the platform auto-builds ./src/Dockerfile
@@ -45,7 +45,7 @@ container:
   storageLimit: 512
   exposePort: 8080
 ad:
-  # Functionality-only persistent SLA checker worker. The ./checker image is
+  # V2 persistent functionality + retained-data checker. The ./checker image is
   # built automatically from its Dockerfile on sync/import — do NOT set
   # checkerImage here; the tooling builds it and wires up the ref. The worker
   # listens on port 8081 and accepts POST /check requests.

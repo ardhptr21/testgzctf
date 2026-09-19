@@ -1,119 +1,141 @@
+"""Ledger Forge V2 hooks. No exploit or privileged flag-reading endpoint.
+
+The checker is an ordinary customer: its private memo contains the flag.
+Defenders may fix JWT confusion and SSTI without changing this flow. Credentials
+are derived from the secret flag, so a replacement worker can log in without
+knowing anything stored in an old worker's filesystem. Placement authorization
+is separate: the framework must durably claim it before calling put_flag.
 """
-SLA test cases for ledger-forge — FUNCTIONALITY ONLY.
+import hashlib
+import hmac
+import secrets
 
-These exercise the legitimate behaviour of the team's expense-ledger API so the
-platform can tell whether it is still working. They deliberately never trigger
-either planted bug (JWT alg-confusion / Jinja2 SSTI) — stealing the flag is the
-attackers' job, not the SLA checker's. A team that patches both bugs keeps SLA
-green as long as the normal register → login → add-entry → list → report flow
-still works; a team that guts core functionality to dodge attacks loses SLA.
-
-Verdicts: return = Ok, raise Mumble = up-but-wrong, t.get/post raise Offline
-for you when the service is unreachable.
-"""
-import requests
-
-from checker import Mumble, Offline, check
+from checker import Infrastructure, Mumble, check
 
 
-def _session(t):
-    """A cookie-persisting session bound to the target, mapping transport
-    errors to Offline so content checks never see a half-dead connection."""
-    s = requests.Session()
-    s.request_orig = s.request
+def identity(flag):
+    """Domain-separated, unpredictable credentials; never team/tick passwords."""
+    def derive(purpose):
+        return hmac.new(flag.value.encode(), ("ledger-forge-v2:" + purpose).encode(), hashlib.sha256).hexdigest()
 
-    def _req(method, path, **kw):
-        kw.setdefault("timeout", 6)
-        try:
-            return s.request_orig(method, t.url + path, **kw)
-        except requests.exceptions.RequestException as e:
-            raise Offline(f"{method} {path}: {e}") from e
-
-    s.req = _req
-    return s
+    return {
+        "username": "ledger_" + derive("username")[:40],
+        "password": derive("password"),
+        "clientId": derive("entry"),
+    }
 
 
-def _json(r):
-    """Parse a JSON body, mapping a non-JSON / malformed response to Mumble.
-
-    A team that breaks a core endpoint so it returns HTML / empty / an error
-    page is "up but wrong" = Mumble. Calling r.json() directly would let
-    requests raise JSONDecodeError, which bubbles out of the check and the
-    harness mis-scores as InternalError (a *checker* bug → no SLA penalty),
-    handing that team a free pass for a broken service. Catch it here so the
-    verdict is the Mumble it should be. (requests' JSONDecodeError subclasses
-    ValueError, so this is version-agnostic.) Returns {} for an empty-but-OK
-    body so callers can keep using .get(...)."""
+def _json(response):
     try:
-        return r.json() or {}
+        body = response.json()
     except ValueError:
-        raise Mumble(f"non-JSON response ({r.status_code}): {r.text[:80]!r}") from None
+        raise Mumble("service returned non-JSON data") from None
+    if not isinstance(body, dict):
+        raise Mumble("service returned an invalid JSON object")
+    return body
+
+
+def _login(t, credentials, *, retention=False):
+    response = t.post("/login", json={key: credentials[key] for key in ("username", "password")})
+    if retention and response.status_code in (401, 403, 404):
+        return None
+    if response.status_code != 200:
+        raise Mumble("ordinary login failed")
+    token = _json(response).get("token")
+    if not isinstance(token, str) or not token:
+        raise Mumble("login did not return a token")
+    return {"Authorization": "Bearer " + token}
 
 
 @check
 def health(t):
-    """GET /health must return a plain 'ok'."""
-    r = t.get("/health")
-    if r.status_code != 200 or r.text.strip() != "ok":
-        raise Mumble(f"/health => {r.status_code} {r.text[:60]!r}")
+    response = t.get("/health")
+    if response.status_code != 200 or response.text.strip() != "ok":
+        raise Mumble("health endpoint failed")
 
 
 @check
 def pubkey(t):
-    """GET /pubkey must return something that looks like a PEM public key.
-
-    Fetching the public key is part of the legitimate API surface (clients
-    verify tokens with it), so the SLA exercises it — but the checker NEVER
-    uses it to forge a token. That's the attacker's path, not ours."""
-    r = t.get("/pubkey")
-    if r.status_code != 200 or "-----BEGIN PUBLIC KEY-----" not in r.text:
-        raise Mumble(f"/pubkey => {r.status_code} {r.text[:80]!r}")
+    response = t.get("/pubkey")
+    if response.status_code != 200 or "-----BEGIN PUBLIC KEY-----" not in response.text:
+        raise Mumble("public-key endpoint failed")
 
 
 @check
 def core_flow(t):
-    """Register → login (RS256 token) → add an entry → list contains it →
-    /me reports role 'user'. All legitimate; no bug is exercised."""
-    s = _session(t)
-    # Deterministic-but-unique identity per (team, round) so reruns don't
-    # collide on the "user exists" (409) path.
-    tag = f"chk_{t.team_id or '0'}_{t.round}"
-    user, pw = tag, "P@ss-" + tag
+    """Independent, harmless ordinary functionality; no historical flag writes."""
+    credentials = {"username": "customer_" + secrets.token_hex(16), "password": secrets.token_hex(32)}
+    response = t.post("/register", json=credentials)
+    if response.status_code != 200:
+        raise Mumble("ordinary registration failed")
+    auth = _login(t, credentials)
+    marker, client_id = "expense-" + secrets.token_hex(16), secrets.token_hex(32)
+    response = t.post("/entries", headers=auth, json={"amount": 127, "memo": marker, "clientId": client_id})
+    if response.status_code != 200 or not _json(response).get("id"):
+        raise Mumble("ordinary entry creation failed")
+    response = t.get("/entries", headers=auth)
+    if response.status_code != 200:
+        raise Mumble("ordinary entry listing failed")
+    entries = _json(response).get("entries")
+    if not isinstance(entries, list) or not any(
+        isinstance(entry, dict) and entry.get("memo") == marker and entry.get("amount") == 127
+        and entry.get("clientId") == client_id for entry in entries
+    ):
+        raise Mumble("ordinary entry was not preserved")
+    response = t.get("/me", headers=auth)
+    data = _json(response)
+    if response.status_code != 200 or data.get("user") != credentials["username"] or data.get("role") != "user":
+        raise Mumble("authenticated profile failed")
 
-    # register (200 fresh / 409 already exists are both fine)
-    r = s.req("POST", "/register", json={"username": user, "password": pw})
-    if r.status_code not in (200, 409):
-        raise Mumble(f"/register => {r.status_code} {r.text[:80]!r}")
 
-    # login -> RS256 bearer token (the legitimate, library-issued token)
-    r = s.req("POST", "/login", json={"username": user, "password": pw})
-    if r.status_code != 200:
-        raise Mumble(f"/login => {r.status_code} {r.text[:80]!r}")
-    token = _json(r).get("token")
-    if not token:
-        raise Mumble(f"/login body has no token => {r.text[:80]!r}")
-    auth = {"Authorization": f"Bearer {token}"}
+def put_flag(t, flag):
+    """Called once after a durable placement claim, ONLY for a newly issued flag.
 
-    # add an expense entry
-    marker = "memo-" + tag
-    amount = 100 + (t.round or 0)
-    r = s.req("POST", "/entries", headers=auth, json={"amount": amount, "memo": marker})
-    if r.status_code != 200:
-        raise Mumble(f"/entries create => {r.status_code} {r.text[:80]!r}")
-    eid = _json(r).get("id")
-    if not eid:
-        raise Mumble(f"/entries create => {r.status_code} {r.text[:80]!r}")
+    Creation is idempotent by clientId. A collision never permits overwriting
+    an existing memo; a missing previously accepted record must stay missing.
+    """
+    credentials = identity(flag)
+    response = t.post("/register", json={key: credentials[key] for key in ("username", "password")})
+    if response.status_code not in (200, 409):
+        raise Mumble("flag account registration failed")
+    auth = _login(t, credentials)
+    response = t.post("/entries", headers=auth, json={
+        "amount": 1, "memo": flag.value, "clientId": credentials["clientId"],
+    })
+    if response.status_code >= 500:
+        raise Infrastructure("entry write outcome is ambiguous")
+    if response.status_code not in (200, 409, 410):
+        raise Mumble("flag entry creation failed")
+    if response.status_code == 200:
+        try:
+            entry_id = _json(response).get("id")
+        except Mumble:
+            raise Infrastructure("entry write acknowledgement is malformed") from None
+        if type(entry_id) is not int or entry_id < 1:
+            raise Infrastructure("entry write acknowledgement is malformed")
+        return "confirmed"
+    return "failed"
 
-    # list shows it back
-    r = s.req("GET", "/entries", headers=auth)
-    if r.status_code != 200:
-        raise Mumble(f"/entries list => {r.status_code} {r.text[:80]!r}")
-    entries = _json(r).get("entries", [])
-    if not any(e.get("memo") == marker for e in entries):
-        raise Mumble(f"/entries list missing memo {marker!r}: {r.text[:120]!r}")
 
-    # /me reports the authenticated user with role 'user'
-    r = s.req("GET", "/me", headers=auth)
-    body = _json(r)
-    if r.status_code != 200 or body.get("user") != user or body.get("role") != "user":
-        raise Mumble(f"/me => {r.status_code} {r.text[:100]!r}")
+def get_flag(t, flag):
+    """Read-only retrieval through the legitimate owner's session on EVERY tick.
+
+    Do not register, recreate entries, use SSTI, forge JWTs, or read /flag here.
+    The framework compares the actual retrieved memo with the expected flag.
+    """
+    credentials = identity(flag)
+    auth = _login(t, credentials, retention=True)
+    if auth is None:
+        return None
+    response = t.get("/entries", headers=auth)
+    if response.status_code in (401, 403, 404, 410):
+        return None
+    if response.status_code != 200:
+        raise Mumble("retained entry listing failed")
+    entries = _json(response).get("entries")
+    if not isinstance(entries, list):
+        raise Mumble("retained entry listing malformed")
+    matches = [entry for entry in entries if isinstance(entry, dict) and entry.get("clientId") == credentials["clientId"]]
+    if len(matches) != 1 or not isinstance(matches[0].get("memo"), str):
+        return None
+    return matches[0]["memo"]

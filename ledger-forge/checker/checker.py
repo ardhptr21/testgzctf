@@ -1,183 +1,312 @@
 #!/usr/bin/env python3
-"""
-Persistent A&D checker worker. You normally DON'T edit this file — add your
-test cases in checks.py (just write a function and decorate it with @check).
+"""Persistent GZCTF V2 worker: functionality + real retained-flag retrieval.
 
-The worker listens on port 8081. The platform sends one JSON POST per check:
-  {"targetIp": "...", "targetPort": 8080, "flag": "...",
-   "round": 1, "teamId": "12"}
-Every request creates a fresh Target and runs all checks in isolation.
-
-Every @check function in checks.py runs in order. To report a verdict,
-either return normally (the check passed) or raise:
-  Mumble(msg)   service reachable but wrong (bad flag, broken endpoint)
-  Offline(msg)  can't reach the service — Target.get/post raise this for you
-Anything else that bubbles out is treated as InternalError (your bug,
-not the team's; the platform doesn't penalize a team for a broken checker).
-
-The response contains the worst verdict across all checks:
-  {"status": "Ok|Mumble|Offline|InternalError", "code": 0|1|2|3}
+Challenge-specific hooks are in checks.py. The platform persists placement
+state BEFORE dispatching a new flag. No pod-local database, privileged flag
+reader, exploit, or repair of historical data is used. An ambiguous first
+write is an infrastructure error, never fabricated missing-flag evidence.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import sys
-import traceback
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 
-# enochecker3 exit-code contract. Ordered by severity so max() aggregates
-# correctly: a single Offline beats any number of Oks, etc.
 OK, MUMBLE, OFFLINE, INTERNAL_ERROR = 0, 1, 2, 3
 _NAME = {OK: "Ok", MUMBLE: "Mumble", OFFLINE: "Offline", INTERNAL_ERROR: "InternalError"}
+MAX_BODY = 1024 * 1024
+MAX_FLAGS = 1000
+_CHECKS = []
+_NEW_CLAIMS = set()
+_CLAIM_LOCK = threading.Lock()
 
 
 class CheckError(Exception):
-    """Base for verdict-bearing exceptions. Bare raises = InternalError."""
-
     status = INTERNAL_ERROR
 
 
 class Mumble(CheckError):
-    """Service is up but behaving wrong (bad flag, broken response)."""
-
+    """The service answered but ordinary functionality is incorrect."""
     status = MUMBLE
 
 
 class Offline(CheckError):
-    """Couldn't reach the service at all (refused / timeout / DNS)."""
-
+    """The target could not be reached within a bounded request."""
     status = OFFLINE
 
 
-_CHECKS: list = []
+class Infrastructure(CheckError):
+    """A checker/placement ambiguity is not a service-outage verdict."""
 
 
 def check(fn):
-    """Register a test case. The function receives a single Target arg."""
     _CHECKS.append(fn)
     return fn
 
 
+@dataclass(frozen=True)
+class RetainedFlag:
+    id: int
+    value: str
+    planted_at_tick: int
+    placement: str
+
+
 @dataclass
 class Target:
-    """The team's service + this tick's context, handed to every check."""
-
     ip: str
     port: int
-    flag: str
     round: int
+    tick: int
+    tick_number: int
     team_id: str
+    challenge_id: int
+    flags: tuple[RetainedFlag, ...]
+    deadline: float = field(default_factory=lambda: time.monotonic() + 24)
+    session: requests.Session = field(default_factory=requests.Session, repr=False)
+
+    def __post_init__(self):
+        self.session.trust_env = False
 
     @property
-    def url(self) -> str:
-        return f"http://{self.ip}:{self.port}"
+    def url(self):
+        host = "[" + self.ip + "]" if ":" in self.ip else self.ip
+        return f"http://{host}:{self.port}"
 
-    def get(self, path: str = "/", **kw) -> "requests.Response":
-        return self._request("GET", path, **kw)
+    def get(self, path="/", **kwargs):
+        return self.request("GET", path, **kwargs)
 
-    def post(self, path: str = "/", **kw) -> "requests.Response":
-        return self._request("POST", path, **kw)
+    def post(self, path="/", **kwargs):
+        return self.request("POST", path, **kwargs)
 
-    def request(self, method: str, path: str = "/", **kw) -> "requests.Response":
-        return self._request(method, path, **kw)
-
-    def _request(self, method: str, path: str, **kw) -> "requests.Response":
-        kw.setdefault("timeout", 5)
+    def request(self, method, path="/", **kwargs):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise Infrastructure("checker execution budget exhausted")
+        kwargs.setdefault("timeout", min(3, remaining))
+        kwargs["allow_redirects"] = False
+        kwargs["stream"] = True
         try:
-            return requests.request(method, self.url + path, **kw)
-        except requests.exceptions.RequestException as e:
-            # No response at all → the service is down for us. Checks that
-            # want to assert on content will simply never reach that code.
-            raise Offline(f"{method} {path}: {e}") from e
+            response = self.session.request(method, self.url + path, **kwargs)
+            chunks, size = [], 0
+            # Small reads enforce a total deadline even if an untrusted target
+            # trickles bytes slowly enough to avoid the socket idle timeout.
+            for chunk in response.iter_content(1):
+                if time.monotonic() >= self.deadline:
+                    response.close()
+                    raise Infrastructure("checker execution budget exhausted")
+                size += len(chunk)
+                if size > MAX_BODY:
+                    response.close()
+                    raise Mumble("service response exceeded the maximum size")
+                chunks.append(chunk)
+            response._content = b"".join(chunks)
+            response._content_consumed = True
+            response.close()
+            return response
+        except requests.exceptions.RequestException:
+            # Never echo target responses, URLs, passwords, or flags into logs.
+            raise Offline("target transport failed") from None
 
 
-def run_once(target: Target) -> int:
-    # Note: the @check functions are registered by importing checks.py,
-    # which run.py does before calling us. We deliberately don't `import
-    # checks` here — running this file directly as __main__ would create a
-    # second copy of this module under the name "checker", and the
-    # decorators in checks.py would register into THAT copy's list instead
-    # of this one. run.py sidesteps that by only ever importing by name.
+def run_once(target):
     if not _CHECKS:
-        print("no checks registered — run via run.py (python3 run.py), "
-              "and add @check functions in checks.py", file=sys.stderr)
-        return INTERNAL_ERROR
-
-    worst = OK
-    for fn in _CHECKS:
-        name = getattr(fn, "__name__", "check")
-        try:
-            fn(target)
-        except CheckError as e:
-            worst = max(worst, e.status)
-            print(f"[{name}] {_NAME[e.status]}: {e}", file=sys.stderr)
-        except Exception as e:  # noqa: BLE001 — any stray error is our bug
-            worst = max(worst, INTERNAL_ERROR)
-            print(f"[{name}] InternalError: {e}", file=sys.stderr)
-            traceback.print_exc()
-        else:
-            print(f"[{name}] Ok", file=sys.stderr)
-
-    print(f"verdict: {_NAME[worst]}", file=sys.stderr)
-    return worst
+        raise Infrastructure("no functionality hooks registered")
+    for hook in _CHECKS:
+        hook(target)
 
 
-def _worker_target(payload: dict) -> Target:
-    return Target(
-        ip=str(payload["targetIp"]),
-        port=int(payload.get("targetPort", 80)),
-        flag=str(payload.get("flag", "")),
-        round=int(payload.get("round", 0)),
-        team_id=str(payload.get("teamId", "")),
-    )
+def _integer(value, name, low=1, high=2147483647):
+    if type(value) is not int or not low <= value <= high:
+        raise ValueError("invalid " + name)
+    return value
+
+
+def _worker_target(payload):
+    if not isinstance(payload, dict) or type(payload.get("protocolVersion")) is not int or payload["protocolVersion"] != 2:
+        raise ValueError("only checker protocol V2 is supported")
+    host = payload.get("targetIp")
+    if not isinstance(host, str):
+        raise ValueError("invalid targetIp")
+    host = str(ipaddress.ip_address(host))
+    tick_number = _integer(payload.get("tickNumber"), "tickNumber")
+    team_id = payload.get("teamId")
+    if not isinstance(team_id, str) or not team_id.isascii() or not team_id.isdigit() or len(team_id) > 20 or int(team_id) < 1:
+        raise ValueError("invalid teamId")
+    raw_flags = payload.get("flags")
+    if not isinstance(raw_flags, list) or not 1 <= len(raw_flags) <= MAX_FLAGS:
+        raise ValueError("invalid retained flags")
+    flags, seen_ids, seen_values = [], set(), set()
+    for item in raw_flags:
+        if not isinstance(item, dict):
+            raise ValueError("invalid retained flag")
+        flag_id = _integer(item.get("id"), "flag id")
+        value = item.get("flag")
+        issued = _integer(item.get("plantedAtTick"), "plantedAtTick", high=tick_number)
+        placement = item.get("placement")
+        if not isinstance(value, str) or not 1 <= len(value) <= 4096 or flag_id in seen_ids or value in seen_values:
+            raise ValueError("invalid or duplicate retained flag")
+        if placement not in ("new", "unknown", "confirmed", "failed"):
+            raise ValueError("platform-v1 placement state required")
+        if placement == "new" and issued != tick_number:
+            raise ValueError("historical flags must never be initialized")
+        flags.append(RetainedFlag(flag_id, value, issued, placement))
+        seen_ids.add(flag_id)
+        seen_values.add(value)
+    if not any(flag.planted_at_tick == tick_number for flag in flags):
+        raise ValueError("no current-tick flag provided")
+    return Target(host, _integer(payload.get("targetPort"), "targetPort", high=65535),
+                  _integer(payload.get("round"), "round"), _integer(payload.get("tick"), "tick"),
+                  tick_number, team_id, _integer(payload.get("challengeId"), "challengeId"), tuple(flags))
+
+
+def _claim_new_once(target, flag):
+    # Duplicate delivery inside the same process must also stay read-only.
+    # The platform ledger handles restarts/replacements and concurrent replicas.
+    identity = (target.team_id, target.challenge_id, flag.id, hashlib.sha256(flag.value.encode()).digest())
+    with _CLAIM_LOCK:
+        if identity in _NEW_CLAIMS:
+            return False
+        _NEW_CLAIMS.add(identity)
+        return True
+
+
+def run_check(target):
+    import checks  # by-name import; run.py already registered the same module
+
+    results = [{"id": flag.id, "retrievable": False,
+                "placement": "unknown" if flag.placement == "new" else flag.placement}
+               for flag in target.flags]
+    status = OK
+    try:
+        run_once(target)
+    except CheckError as exc:
+        status = exc.status
+    except Exception:
+        status = INTERNAL_ERROR
+
+    can_place = status != INTERNAL_ERROR
+    try:
+        for flag, result in zip(target.flags, results):
+            if flag.placement == "new":
+                if not can_place:
+                    # No placement attempt: root can distinguish this response
+                    # from a lost response via the explicit failed state.
+                    result["placement"] = "failed"
+                elif _claim_new_once(target, flag):
+                    try:
+                        result["placement"] = checks.put_flag(target, flag)
+                        # A target acknowledgement proves it accepted this
+                        # placement; only actual readback proves retention.
+                    except Mumble:
+                        result["placement"] = "failed"
+                    except (Offline, Infrastructure):
+                        result["placement"] = "unknown"
+                else:
+                    flag = replace(flag, placement="unknown")
+            try:
+                actual = checks.get_flag(target, flag)
+                found = isinstance(actual, str) and hmac.compare_digest(actual.encode(), flag.value.encode())
+            except Mumble:
+                found = False
+            except Offline:
+                status = max(status, OFFLINE)
+                found = False
+            result["retrievable"] = found
+            if found:
+                result["placement"] = "confirmed"
+            elif result["placement"] == "unknown":
+                # A write may have succeeded before a lost response. No repair
+                # and no negative retention evidence can safely be asserted.
+                status = INTERNAL_ERROR
+        return {"status": _NAME[status], "code": status, "flags": results}
+    except Exception:
+        # Unknown checker errors never become service failure evidence.
+        return {"status": "InternalError", "code": INTERNAL_ERROR, "flags": results}
+    finally:
+        target.session.close()
+
+
+class WorkerServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 16
+
+    def __init__(self, address, token):
+        if not token:
+            raise ValueError("GZCTF_CHECKER_TOKEN must be configured")
+        self.token = token
+        self.check_lock = threading.Lock()
+        super().__init__(address, _WorkerHandler)
 
 
 class _WorkerHandler(BaseHTTPRequestHandler):
-    server_version = "GZCTF-Checker-Worker/1"
+    server_version = "GZCTF-Checker-Worker/2"
 
-    def _json(self, status: int, body: dict) -> None:
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
+    def _json(self, status, body):
         raw = json.dumps(body, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(raw)
 
-    def do_GET(self) -> None:  # noqa: N802
-        self._json(200, {"status": "ready"}) if self.path == "/healthz" else self._json(404, {"error": "not found"})
+    def do_GET(self):  # noqa: N802
+        if self.path == "/healthz":
+            self._json(200, {"status": "ready", "protocolVersion": 2, "flagPlacement": "platform-v1"})
+        else:
+            self._json(404, {"error": "not found"})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self):  # noqa: N802
         if self.path != "/check":
             self._json(404, {"error": "not found"})
             return
-        expected = os.environ.get("GZCTF_CHECKER_TOKEN", "")
-        if expected and self.headers.get("X-GZCTF-Checker-Token", "") != expected:
-            self._json(401, {"status": "InternalError", "code": INTERNAL_ERROR, "error": "unauthorized"})
+        supplied = self.headers.get("X-GZCTF-Checker-Token", "")
+        if not hmac.compare_digest(supplied.encode(), self.server.token.encode()):
+            self._json(401, {"status": "InternalError", "code": INTERNAL_ERROR})
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= MAX_BODY or self.headers.get("Transfer-Encoding"):
+                raise ValueError("invalid request length")
+            if self.headers.get_content_type() != "application/json":
+                raise ValueError("application/json required")
             payload = json.loads(self.rfile.read(length))
-            verdict = run_once(_worker_target(payload))
-            self._json(200, {"status": _NAME[verdict], "code": verdict})
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            self._json(400, {"status": "InternalError", "code": INTERNAL_ERROR, "error": str(exc)})
-        except Exception as exc:  # noqa: BLE001 — one failed request must not kill the worker
-            traceback.print_exc()
-            self._json(200, {"status": "InternalError", "code": INTERNAL_ERROR, "error": str(exc)})
+            target = _worker_target(payload)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self._json(400, {"status": "InternalError", "code": INTERNAL_ERROR, "error": "invalid V2 request"})
+            return
+        if not self.server.check_lock.acquire(blocking=False):
+            target.session.close()
+            self._json(503, {"status": "InternalError", "code": INTERNAL_ERROR, "error": "worker is busy"})
+            return
+        try:
+            self._json(200, run_check(target))
+        finally:
+            self.server.check_lock.release()
 
-    def log_message(self, fmt: str, *args) -> None:
-        print(f"checker-worker: {fmt % args}", file=sys.stderr)
+    def log_message(self, *_args):
+        pass  # Request bodies, flags, credentials and target replies are secret.
 
 
-def worker() -> None:
+def worker():
     host = os.environ.get("GZCTF_CHECKER_BIND", "0.0.0.0")
     port = int(os.environ.get("GZCTF_CHECKER_PORT", "8081"))
-    server = ThreadingHTTPServer((host, port), _WorkerHandler)
-    print(f"checker worker listening on {host}:{port}", file=sys.stderr, flush=True)
+    server = WorkerServer((host, port), os.environ.get("GZCTF_CHECKER_TOKEN", ""))
+    print(f"V2 checker worker listening on {host}:{port}", file=sys.stderr, flush=True)
     try:
         server.serve_forever()
     finally:
@@ -185,7 +314,5 @@ def worker() -> None:
 
 
 if __name__ == "__main__":
-    # This image is intentionally persistent-only. Always start it through
-    # run.py so checks.py is imported and registered before serving HTTP.
     print("persistent worker: start with python3 run.py", file=sys.stderr)
     sys.exit(INTERNAL_ERROR)
