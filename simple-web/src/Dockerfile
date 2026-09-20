@@ -11,8 +11,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py Makefile /app/
 COPY supervisord.conf /etc/supervisord.conf
 
-ARG FLAG="flag{simple_web_demo_flag}"
-RUN printf '%s\n' "$FLAG" > /flag && chmod 444 /flag
-
 EXPOSE 8080
 CMD ["supervisord", "-c", "/etc/supervisord.conf"]

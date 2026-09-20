@@ -11,8 +11,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py Makefile /app/
 COPY supervisord.conf /etc/supervisord.conf
 
-ARG FLAG="flag{reused_streams_are_not_random}"
-RUN printf '%s\n' "$FLAG" > /flag && chmod 444 /flag
-
 EXPOSE 8082
 CMD ["supervisord", "-c", "/etc/supervisord.conf"]
