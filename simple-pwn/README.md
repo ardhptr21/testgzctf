@@ -9,7 +9,7 @@ Build and run the service container:
 
 ```sh
 docker build -t simple-pwn ./src
-docker run --rm -p 8080:8080 simple-pwn
+docker run --rm -p 8081:8081 simple-pwn
 ```
 
 Inside the container, build and service lifecycle are managed through the

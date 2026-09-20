@@ -17,7 +17,7 @@ def recv_until(sock, marker):
     return data
 
 
-def solve(host="127.0.0.1", port=8080):
+def solve(host="127.0.0.1", port=8081):
     with socket.create_connection((host, port), timeout=5) as sock:
         banner = recv_until(sock, b"name:\n")
         match = re.search(rb"gift: (0x[0-9a-fA-F]+)", banner)
@@ -38,7 +38,7 @@ def solve(host="127.0.0.1", port=8080):
 
 if __name__ == "__main__":
     target_host = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-    target_port = int(sys.argv[2]) if len(sys.argv) > 2 else 8080
+    target_port = int(sys.argv[2]) if len(sys.argv) > 2 else 8081
     recovered = solve(target_host, target_port)
     if not recovered:
         print("flag not found", file=sys.stderr)

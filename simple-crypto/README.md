@@ -9,7 +9,7 @@ Build and run the service container:
 
 ```sh
 docker build -t simple-crypto ./src
-docker run --rm -p 8080:8080 simple-crypto
+docker run --rm -p 8082:8082 simple-crypto
 ```
 
 Inside the container, service lifecycle is managed through the provided

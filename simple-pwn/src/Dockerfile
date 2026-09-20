@@ -12,5 +12,5 @@ COPY supervisord.conf /etc/supervisord.conf
 ARG FLAG="flag{ret2win_is_the_first_step}"
 RUN printf '%s\n' "$FLAG" > /flag && chmod 444 /flag
 
-EXPOSE 8080
+EXPOSE 8081
 CMD ["supervisord", "-c", "/etc/supervisord.conf"]
