@@ -1,0 +1,19 @@
+name: simple-crypto
+author: JCC
+description: >
+  A tiny encryption-oracle service. The flag is encrypted, and you can ask the
+  service to encrypt your own messages. Find the reused keystream mistake and
+  recover the flag.
+type: AttackDefense
+category: Crypto
+container:
+  containerImage: 10.104.0.2:5000/simle-crypto:latest
+  memoryLimit: 256
+  cpuCount: 1
+  storageLimit: 256
+  exposePort: 8082
+
+ad:
+  checkerImage: "10.104.0.2:5000/checker/simple-crypto:latest"
+  allowEgress: false
+  allowSelfReset: true

@@ -1,0 +1,19 @@
+name: simple-pwn
+author: JCC
+description: >
+  A tiny TCP binary exploitation challenge. The service leaks a helper function
+  address, then reads too much input into a stack buffer. Redirect execution to
+  the helper and recover the flag.
+type: AttackDefense
+category: Pwn
+container:
+  containerImage: 10.104.0.2:5000/simple-pwn:latest
+  memoryLimit: 256
+  cpuCount: 1
+  storageLimit: 256
+  exposePort: 8081
+
+ad:
+  checkerImage: 10.104.0.2:5000/checker/simple-pwn:latest
+  allowEgress: false
+  allowSelfReset: true

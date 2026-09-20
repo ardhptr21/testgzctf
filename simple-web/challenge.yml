@@ -1,0 +1,20 @@
+name: simple-web
+author: JCC
+description: >
+  A tiny Flask greeting-preview service. The preview feature renders your custom
+  message template with Jinja2. Find the server-side template injection and read
+  the flag from `/flag`.
+
+type: AttackDefense
+category: Web
+container:
+  containerImage: "10.104.0.2:5000/simple-web:latest"
+  memoryLimit: 256
+  cpuCount: 1
+  storageLimit: 256
+  exposePort: 8080
+
+ad:
+  checkerImage: "10.104.0.2:5000/checker/simple-web:latest"
+  allowEgress: false
+  allowSelfReset: true
